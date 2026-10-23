@@ -3,7 +3,7 @@ class Mcv < Formula
   homepage "https://github.com/IntrepidT/homebrew-mcv"
   url "https://github.com/IntrepidT/homebrew-mcv.git",
       tag:      "v0.1.0",
-      revision: "0000000000000000000000000000000000000000"
+      revision: "382e8e99a8af25a813bcc4d4557c0e925ff8848f"
   license "Apache-2.0"
   head "https://github.com/IntrepidT/homebrew-mcv.git", branch: "main"
 
