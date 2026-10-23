@@ -1,0 +1,110 @@
+#!/bin/sh
+# mcv: Thien's tmux + Neovim, run beside (never over) the host user's own setup.
+set -eu
+
+MCV_SHARE="@MCV_SHARE@" # replaced with the formula's opt_pkgshare at install time
+SOCKET=mcv
+NVIM_LINK="${XDG_CONFIG_HOME:-$HOME/.config}/mcv"
+DATA="${XDG_DATA_HOME:-$HOME/.local/share}/mcv"
+STATE="${XDG_STATE_HOME:-$HOME/.local/state}/mcv"
+PINNED="$MCV_SHARE/lazy-lock.pinned.json"
+
+export MCV_SHARE
+export NVIM_APPNAME=mcv
+
+usage() {
+  cat <<EOF
+usage: mcv [command]
+
+  (none)       start or attach to the mcv tmux session
+  nvim [args]  run mcv's Neovim directly, outside tmux
+  clean        stop mcv's tmux server and delete all mcv state from \$HOME
+  help         show this help
+EOF
+}
+
+link_config() {
+  if [ -e "$NVIM_LINK" ] && [ ! -L "$NVIM_LINK" ]; then
+    echo "mcv: $NVIM_LINK exists and is not a symlink; refusing to replace it" >&2
+    exit 1
+  fi
+  mkdir -p "$(dirname "$NVIM_LINK")"
+  ln -sfn "$MCV_SHARE/nvim" "$NVIM_LINK"
+}
+
+# A fresh LazyVim install rewrites the lockfile mid-install and drops pins for
+# plugins imported late (extras), so re-pin from the pristine copy and restore.
+# Re-runs whenever an upgrade ships a new lockfile.
+sync_plugins() {
+  if cmp -s "$PINNED" "$DATA/lazy-lock.applied.json"; then return; fi
+  echo "mcv: installing plugins pinned to lazy-lock.json..." >&2
+  nvim --headless +qa
+  cp "$PINNED" "$MCV_SHARE/nvim/lazy-lock.json"
+  nvim --headless "+Lazy! restore" +qa
+  mkdir -p "$DATA"
+  cp "$PINNED" "$DATA/lazy-lock.applied.json"
+}
+
+# Keep my shell history out of the host's: zsh reads these shims, which run the host's real
+# dotfiles and then pin HISTFILE to mcv's state dir (macOS /etc/zshrc overrides an exported one).
+shell_isolation() {
+  zdot="$STATE/zsh"
+  mkdir -p "$zdot"
+  for f in .zshenv .zprofile .zshrc .zlogin .zlogout; do
+    cat >"$zdot/$f" <<EOF
+ZDOTDIR="\${MCV_HOST_ZDOTDIR:-\$HOME}"
+[ -f "\$ZDOTDIR/$f" ] && . "\$ZDOTDIR/$f"
+MCV_HOST_ZDOTDIR="\$ZDOTDIR"; ZDOTDIR="$zdot"; HISTFILE="$zdot/.zsh_history"
+EOF
+  done
+  export MCV_HOST_ZDOTDIR="${ZDOTDIR:-$HOME}"
+  export ZDOTDIR="$zdot"
+  export HISTFILE="$STATE/bash_history"
+}
+
+start() {
+  case "${TMUX:-}" in
+    */"$SOCKET",*) echo "mcv: already inside the mcv session" >&2; exit 1 ;;
+  esac
+  link_config
+  sync_plugins
+  shell_isolation
+  unset TMUX # nest inside the host's own tmux if there is one
+  exec tmux -L "$SOCKET" -f "$MCV_SHARE/tmux/tmux.conf" new-session -A -s mcv
+}
+
+descendants() {
+  echo "$1"
+  pgrep -P "$1" | while read -r child; do descendants "$child"; done
+}
+
+# Kill the server, then wait for pane processes (nvim, Mason installs) so none recreate state after rm.
+stop_server() {
+  pids=$(tmux -L "$SOCKET" list-panes -a -F '#{pane_pid}' 2>/dev/null | while read -r p; do descendants "$p"; done)
+  tmux -L "$SOCKET" kill-server 2>/dev/null || true
+  for _ in $(seq 50); do
+    alive=""
+    for pid in $pids; do if kill -0 "$pid" 2>/dev/null; then alive=1; fi; done
+    if [ -z "$alive" ]; then return; fi
+    sleep 0.2
+  done
+  for pid in $pids; do kill -9 "$pid" 2>/dev/null || true; done
+}
+
+clean() {
+  stop_server
+  if [ -L "$NVIM_LINK" ]; then rm "$NVIM_LINK"; fi
+  for dir in "$DATA" "$STATE" "${XDG_CACHE_HOME:-$HOME/.cache}/mcv"; do
+    if [ -d "$dir" ]; then chmod -R u+w "$dir"; fi # Go marks module cache files read-only
+    rm -rf "$dir"
+  done
+  echo "mcv: removed all mcv state; run 'brew uninstall mcv' to finish"
+}
+
+case "${1:-}" in
+  "") start ;;
+  nvim) shift; link_config; sync_plugins; exec nvim "$@" ;;
+  clean) clean ;;
+  help | -h | --help) usage ;;
+  *) usage >&2; exit 2 ;;
+esac
